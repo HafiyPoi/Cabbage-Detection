@@ -1,15 +1,12 @@
-# Cabbage-Detection
-""This project develops an AI-based smart farming mobile robot for cabbage inspection. It integrates YOLOv8 image detection, a camera system, and an Arduino Mega 2560 controlling motors via Cytron MD10A Rev2.0. A Sony DualSense Wireless Controller enables real-time manual control, allowing flexible and efficient field monitoring.""
-
 """
 FYP – AI Smart Farming
-Phase 2: Mobile Platform + YOLOv8 Detection + Sequential Cabbage Inspection
-Pattern: Column 1 (right): cabbages 1-7 top-to-bottom, Column 2 (left): 7-1 bottom-to-top
+Manual mobile platform control with live YOLOv8 cabbage detection display
 """
 
 import ssl
 import urllib.request
 import os
+from pathlib import Path
 
 # Fix SSL certificate verification error
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -39,6 +36,7 @@ PS5_DEADZONE = 0.30
 PS5_POLL_INTERVAL = 0.05
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
+DETECTION_DEVICE = "cpu"
 
 
 def configure_camera(cam, name="camera"):
@@ -56,16 +54,9 @@ def configure_camera(cam, name="camera"):
     print(f"[INFO] {name} configured to {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
 
 # ===== MOBILE PLATFORM CONFIGURATION =====
-# Arduino motor control functions (to be implemented)
 PLATFORM_SPEED = 50
 TURN_SPEED = 30
-CABBAGE_DISTANCE_CM = 20  # 20cm between cabbages vertically
-COLUMN_DISTANCE_CM = 5    # 5cm between columns horizontally
-CABBAGES_PER_COLUMN = 7
 
-# ===== MYCOBOT SCAN CONFIGURATION =====
-# Base scan angles (left → right)
-SCAN_ANGLES = [-15, -7, 0, 7, 15]
 SCAN_SPEED = 60
 
 # ===== TRUE LOW-HEIGHT CABBAGE INSPECTION POSTURE =====
@@ -74,14 +65,6 @@ J3_FORWARD = 80
 J4         = -20
 J5         = -20
 J6_CAMERA  = 50   # CAMERA LOOKS DOWN (KEY FIX)
-
-# ===== DETECTION SEQUENCE =====
-# Column 1 (right): cabbages 1-7 (top to bottom)
-# Column 2 (left): cabbages 7-1 (bottom to top)
-SEQUENCE = [
-    ("Column 1", "Right", list(range(1, CABBAGES_PER_COLUMN + 1))),      # 1,2,3,4,5,6,7
-    ("Column 2", "Left", list(range(CABBAGES_PER_COLUMN, 0, -1)))       # 7,6,5,4,3,2,1
-]
 
 # ===== ARDUINO PLATFORM CONTROL =====
 ARDUINO_PORT = '/dev/cu.usbmodem12201'  # Adjust based on your Arduino port
@@ -189,10 +172,81 @@ def is_at_cabbage_position(frame):
 
     return green_pixels > total_pixels * 0.1  # 10% green indicates cabbage presence
 
-print("[INFO] Loading YOLOv8 pretrained models...")
-model_nano = YOLO("yolov8n.pt")   # Nano - fastest, smallest
-model_small = YOLO("yolov8s.pt")  # Small - balanced speed/accuracy
-model_medium = YOLO("yolov8m.pt") # Medium - higher accuracy, slower
+
+def get_selected_result(frame, model_choice, conf_threshold):
+    if model_choice == "nano":
+        return model_nano.predict(source=frame, device=DETECTION_DEVICE, verbose=False)[0]
+    if model_choice == "small":
+        return model_small.predict(source=frame, device=DETECTION_DEVICE, verbose=False)[0]
+    if model_choice == "medium":
+        return model_medium.predict(source=frame, device=DETECTION_DEVICE, verbose=False)[0]
+
+    results_nano = model_nano.predict(source=frame, device=DETECTION_DEVICE, verbose=False)[0]
+    results_small = model_small.predict(source=frame, device=DETECTION_DEVICE, verbose=False)[0]
+    results_medium = model_medium.predict(source=frame, device=DETECTION_DEVICE, verbose=False)[0]
+
+    def top_conf(result):
+        if getattr(result, "probs", None) is None:
+            return 0.0
+        return float(result.probs.top1conf.item() * 100)
+
+    return max(
+        [results_nano, results_small, results_medium],
+        key=top_conf,
+    )
+
+
+def get_detection_summary(result):
+    probs = getattr(result, "probs", None)
+    if probs is None:
+        return {
+            "condition": "No prediction",
+            "confidence": 0.0,
+            "accuracy_text": "mAP: validation metric only",
+            "detections": 0,
+        }
+
+    top1_idx = int(probs.top1)
+    top1_conf = float(probs.top1conf.item() * 100)
+    names = result.names if hasattr(result, "names") else {}
+    condition = str(names.get(top1_idx, f"Class {top1_idx}")).replace("_", " ").title()
+
+    if top1_conf < conf_threshold_runtime:
+        condition = "Uncertain"
+
+    return {
+        "condition": condition,
+        "confidence": top1_conf,
+        "accuracy_text": "mAP: validation metric only",
+        "detections": 1,
+    }
+
+
+def resolve_model_path(variant_key):
+    """Prefer trained classification weights; fallback to pretrained cls weights."""
+    trained = Path(f"/Users/hafiyimran/Desktop/cabbage_cls_runs/cabbage_cls_yolov8{variant_key}/weights/best.pt")
+    if trained.exists():
+        return str(trained)
+    return f"yolov8{variant_key}-cls.pt"
+
+
+print("[INFO] Loading YOLOv8 detection + classification models...")
+print(f"[INFO] Inference device forced to: {DETECTION_DEVICE}")
+detector_model = YOLO("yolov8n.pt")
+print("[INFO] Detector model: yolov8n.pt")
+model_nano_path = resolve_model_path("n")
+model_small_path = resolve_model_path("s")
+model_medium_path = resolve_model_path("m")
+print(f"[INFO] Nano model: {model_nano_path}")
+print(f"[INFO] Small model: {model_small_path}")
+print(f"[INFO] Medium model: {model_medium_path}")
+
+model_nano = YOLO(model_nano_path)
+model_small = YOLO(model_small_path)
+model_medium = YOLO(model_medium_path)
+
+# Runtime threshold used to mark very low-confidence predictions as uncertain.
+conf_threshold_runtime = CONF_THRESHOLD * 100
 
 # Initialize platform camera for positioning
 platform_cap = cv2.VideoCapture(1)  # Second camera for platform positioning
@@ -232,123 +286,144 @@ except Exception as e:
 class InspectionThread(QtCore.QThread):
     frame_signal = QtCore.pyqtSignal(np.ndarray)
     status_signal = QtCore.pyqtSignal(str)
+    metrics_signal = QtCore.pyqtSignal(str, str, float, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.conf_threshold = CONF_THRESHOLD
-        self.model_choice = "multi"  # options: nano, small, medium, multi
+        self.model_choice = "nano"  # options: nano, small, medium, multi
         self._running = False
 
     def set_conf_threshold(self, value):
         # slider gives 0-100
+        global conf_threshold_runtime
         self.conf_threshold = value / 100.0
+        conf_threshold_runtime = self.conf_threshold * 100
 
     def set_model_choice(self, choice):
         self.model_choice = choice
 
     def run(self):
         self._running = True
-        self.status_signal.emit("Inspection thread started")
-        for column_name, column_side, cabbage_sequence in SEQUENCE:
-            if self.isInterruptionRequested():
-                break
-            self.status_signal.emit(f"Starting {column_name} ({column_side})")
-            for cabbage_num in cabbage_sequence:
-                if self.isInterruptionRequested():
-                    break
-                self.status_signal.emit(f"Processing {column_name} - Cabbage {cabbage_num}")
-                self.status_signal.emit("Starting multi-angle scan")
-                for base_angle in SCAN_ANGLES:
-                    if self.isInterruptionRequested():
-                        break
-                    if robot_connected:
-                        mc.send_angles(
-                            [base_angle, J2_DOWN, J3_FORWARD, J4, J5, J6_CAMERA],
-                            SCAN_SPEED
+        self.status_signal.emit("Live detection started")
+        while not self.isInterruptionRequested():
+            try:
+                ret, frame = cap.read()
+                if not ret:
+                    self.status_signal.emit("[ERROR] Failed to read camera frame")
+                    time.sleep(0.1)
+                    continue
+                annotated = frame.copy()
+
+                det_result = detector_model.predict(
+                    source=frame,
+                    device=DETECTION_DEVICE,
+                    conf=self.conf_threshold,
+                    verbose=False,
+                )[0]
+
+                boxes = det_result.boxes
+                names = det_result.names if hasattr(det_result, "names") else {}
+                best_summary = None
+
+                if boxes is not None and len(boxes) > 0:
+                    for i in range(len(boxes)):
+                        x1, y1, x2, y2 = boxes.xyxy[i].int().tolist()
+                        x1 = max(0, x1)
+                        y1 = max(0, y1)
+                        x2 = min(frame.shape[1], x2)
+                        y2 = min(frame.shape[0], y2)
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+
+                        det_conf = float(boxes.conf[i].item() * 100)
+                        det_cls = int(boxes.cls[i].item())
+                        det_name = str(names.get(det_cls, f"class_{det_cls}"))
+
+                        crop = frame[y1:y2, x1:x2]
+                        cls_result = get_selected_result(crop, self.model_choice, self.conf_threshold)
+                        summary = get_detection_summary(cls_result)
+
+                        if best_summary is None or summary["confidence"] > best_summary["confidence"]:
+                            best_summary = summary
+
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        label = (
+                            f"{det_name} {det_conf:.1f}% | "
+                            f"{summary['condition']} {summary['confidence']:.1f}%"
                         )
-                        time.sleep(1.2)
-                    else:
-                        time.sleep(0.5)
-                    ret, frame = cap.read()
-                    if not ret:
-                        self.status_signal.emit("[ERROR] Failed to read camera frame")
-                        continue
-                    # choose model
-                    if self.model_choice == "nano":
-                        results = model_nano(frame, conf=self.conf_threshold)
-                        current = results[0]
-                    elif self.model_choice == "small":
-                        results = model_small(frame, conf=self.conf_threshold)
-                        current = results[0]
-                    elif self.model_choice == "medium":
-                        results = model_medium(frame, conf=self.conf_threshold)
-                        current = results[0]
-                    else:  # multi
-                        rn = model_nano(frame, conf=self.conf_threshold)
-                        rs = model_small(frame, conf=self.conf_threshold)
-                        rm = model_medium(frame, conf=self.conf_threshold)
-                        all_results = [rn[0], rs[0], rm[0]]
-                        current = max(all_results, key=lambda r: max(r.boxes.conf.cpu().numpy()) if len(r.boxes) > 0 else 0)
-                    annotated = current.plot()
-                    # metrics
-                    detections = current.boxes
-                    num_detections = len(detections)
-                    if num_detections > 0:
-                        confidences = detections.conf.cpu().numpy()
-                        avg_confidence = np.mean(confidences) * 100
-                        min_confidence = np.min(confidences) * 100
-                        max_confidence = np.max(confidences) * 100
-                    else:
-                        avg_confidence = min_confidence = max_confidence = 0
-                    # overlay texts
+                        cv2.putText(
+                            annotated,
+                            label,
+                            (x1, max(20, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 255, 0),
+                            2,
+                        )
+                else:
                     cv2.putText(
                         annotated,
-                        f"{column_name} | Cabbage {cabbage_num} | Base: {base_angle}°",
+                        "No object detected",
                         (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.8,
-                        (0, 255, 0),
-                        2
-                    )
-                    cv2.putText(
-                        annotated,
-                        f"Phase 2: Sequential Inspection | {column_side} Column",
-                        (20, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (255, 255, 0),
-                        2
-                    )
-                    cv2.putText(
-                        annotated,
-                        f"Detections: {num_detections} | Avg Conf: {avg_confidence:.1f}% | Model:{self.model_choice}",
-                        (20, 120),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
                         (0, 165, 255),
-                        2
+                        2,
                     )
-                    cv2.putText(
-                        annotated,
-                        f"Min:{min_confidence:.1f}% Max:{max_confidence:.1f}%",
-                        (20, 150),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 165, 255),
-                        2
-                    )
-                    self.frame_signal.emit(annotated)
-                    time.sleep(0.02)
-                self.status_signal.emit(f"Completed Cabbage {cabbage_num}")
-            self.status_signal.emit(f"Completed {column_name}")
-        self.status_signal.emit("Inspection sequence completed")
-        stop_platform()
-        cap.release()
-        if platform_cap:
-            platform_cap.release()
-        cv2.destroyAllWindows()
-        if robot_connected:
-            mc.send_angles([0, 0, 0, 0, 0, 0], 40)
+                    best_summary = {
+                        "condition": "No prediction",
+                        "confidence": 0.0,
+                        "accuracy_text": "mAP: validation metric only",
+                    }
+
+                summary = best_summary if best_summary else {
+                    "condition": "No prediction",
+                    "confidence": 0.0,
+                    "accuracy_text": "mAP: validation metric only",
+                }
+
+                cv2.putText(
+                    annotated,
+                    f"Condition: {summary['condition']}",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2
+                )
+                cv2.putText(
+                    annotated,
+                    f"Confidence: {summary['confidence']:.1f}% | Model: {self.model_choice}",
+                    (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 0),
+                    2
+                )
+                cv2.putText(
+                    annotated,
+                    f"{summary['accuracy_text']}",
+                    (20, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 165, 255),
+                    2
+                )
+
+                self.metrics_signal.emit(
+                    summary['condition'],
+                    summary['condition'],
+                    summary['confidence'],
+                    summary['accuracy_text'],
+                )
+                self.frame_signal.emit(annotated)
+                time.sleep(0.02)
+            except Exception as e:
+                self.status_signal.emit(f"[ERROR] Detection failed: {e}")
+                time.sleep(0.1)
+
+        self.status_signal.emit("Live detection stopped")
         self._running = False
 
 
@@ -360,8 +435,8 @@ class MainWindow(QtWidgets.QWidget):
         self.video_label.setFixedSize(640,480)
         self.video_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.video_label.setStyleSheet("background-color: black;")
-        self.start_btn = QtWidgets.QPushButton("Start")
-        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.start_btn = QtWidgets.QPushButton("Start Detection")
+        self.stop_btn = QtWidgets.QPushButton("Stop Detection")
         self.ps5_start_btn = QtWidgets.QPushButton("Start PS5 Control")
         self.ps5_stop_btn = QtWidgets.QPushButton("Stop PS5 Control")
         self.conf_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
@@ -369,7 +444,12 @@ class MainWindow(QtWidgets.QWidget):
         self.conf_slider.setValue(int(CONF_THRESHOLD*100))
         self.model_combo = QtWidgets.QComboBox()
         self.model_combo.addItems(["nano","small","medium","multi"])
+        self.model_combo.setCurrentText("nano")
         self.status_label = QtWidgets.QLabel("Status: idle")
+        self.condition_label = QtWidgets.QLabel("Health Condition: waiting")
+        self.detected_class_label = QtWidgets.QLabel("Detected Class: waiting")
+        self.confidence_label = QtWidgets.QLabel("Confidence: 0.0%")
+        self.map_label = QtWidgets.QLabel("mAP: validation metric only")
 
         layout = QtWidgets.QVBoxLayout()
         layout.addWidget(self.video_label)
@@ -385,6 +465,10 @@ class MainWindow(QtWidgets.QWidget):
         layout.addWidget(self.conf_slider)
         layout.addWidget(QtWidgets.QLabel("Model:"))
         layout.addWidget(self.model_combo)
+        layout.addWidget(self.condition_label)
+        layout.addWidget(self.detected_class_label)
+        layout.addWidget(self.confidence_label)
+        layout.addWidget(self.map_label)
         layout.addWidget(self.status_label)
         self.setLayout(layout)
 
@@ -400,6 +484,7 @@ class MainWindow(QtWidgets.QWidget):
 
         self.worker.frame_signal.connect(self.update_frame)
         self.worker.status_signal.connect(self.update_status)
+        self.worker.metrics_signal.connect(self.update_metrics)
         self.start_btn.clicked.connect(self.start_inspection)
         self.stop_btn.clicked.connect(self.stop_inspection)
         self.ps5_start_btn.clicked.connect(self.start_ps5_control)
@@ -421,6 +506,12 @@ class MainWindow(QtWidgets.QWidget):
     def update_status(self, text):
         self.status_label.setText(f"Status: {text}")
 
+    def update_metrics(self, condition, detected_class, confidence, accuracy_text):
+        self.condition_label.setText(f"Health Condition: {condition}")
+        self.detected_class_label.setText(f"Detected Class: {detected_class}")
+        self.confidence_label.setText(f"Confidence: {confidence:.1f}%")
+        self.map_label.setText(accuracy_text)
+
     def start_inspection(self):
         if not self.worker.isRunning():
             self.worker.start()
@@ -430,10 +521,6 @@ class MainWindow(QtWidgets.QWidget):
             self.worker.requestInterruption()
 
     def start_ps5_control(self):
-        if self.worker.isRunning():
-            self.update_status("Stop inspection before starting PS5 control")
-            return
-
         if not PYGAME_AVAILABLE:
             self.update_status("PS5 control unavailable: install pygame")
             return
